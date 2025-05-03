@@ -3,6 +3,7 @@ import mysql.connector
 import os
 import logging
 import json
+import requests
 from ultralytics import YOLO
 
 # === ЛОГИ ===
@@ -34,11 +35,11 @@ DB_CONFIG = {
     'autocommit': True
 }
 
-# === МОДЕЛЬ YOLO ===
-# Используем обученную модель из runs/detect/parking_space_model11/weights/best.pt
-model = YOLO('runs/detect/parking_space_model/weights/best.pt')
+# === URL Laravel-эндпоинта ===
+LARAVEL_ENDPOINT = 'http://localhost:8000/api/ai-request/update'
 
-# Порог уверенности
+# === МОДЕЛЬ YOLO ===
+model = YOLO('runs/detect/parking_space_model/weights/best.pt')
 CONFIDENCE_THRESHOLD = 0.3
 
 # === ФУНКЦИИ ===
@@ -77,12 +78,26 @@ def get_upload_path(cursor, upload_id):
     row = cursor.fetchone()
     return row['path'] if row else None
 
+def notify_laravel(task_id, conn):
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM ai_requests WHERE id = %s", (task_id,))
+        data = cur.fetchone()
+        if not data:
+            log_error(f"[Task {task_id}] ❗ Не удалось получить данные для отправки")
+            return
+        response = requests.post(LARAVEL_ENDPOINT, json=data)
+        if response.status_code == 200:
+            log_info(f"[Task {task_id}] 🔔 Laravel уведомлен об обновлении")
+        else:
+            log_error(f"[Task {task_id}] ⚠️ Ошибка при POST в Laravel: {response.status_code}, {response.text}")
+    except Exception as e:
+        log_error(f"[Task {task_id}] 💥 Ошибка при отправке запроса в Laravel: {e}")
+
 def process_task(cursor, task):
     task_id = task['id']
     upload_id = task['upload_id']
-
     update_status(cursor, task_id, 'processing')
-
     start_time = time.time()
 
     upload_path = get_upload_path(cursor, upload_id)
@@ -90,48 +105,36 @@ def process_task(cursor, task):
         elapsed = time.time() - start_time
         update_error(cursor, task_id, f"File not found for upload_id {upload_id}", elapsed)
         log_error(f"[Task {task_id}] ❌ Файл не найден для upload_id={upload_id}")
+        notify_laravel(task_id, cursor.connection)
         return
 
     file_path = os.path.join('storage/app/public', upload_path)
 
     try:
-        # Предсказание с помощью модели
-        results = model(file_path, imgsz=640)  # Можно увеличить imgsz для больших изображений
+        results = model(file_path, imgsz=640)
         boxes = results[0].boxes
 
-        # Отфильтруем объекты типа "occupied" (class == 0) и "vacant" (class == 1)
-        occupied_spots = [b for b in boxes if int(b.cls[0]) == 0]  # Класс 0 — это occupied
-        vacant_spots = [b for b in boxes if int(b.cls[0]) == 1]    # Класс 1 — это vacant
+        occupied_spots = [b for b in boxes if int(b.cls[0]) == 0]
+        vacant_spots = [b for b in boxes if int(b.cls[0]) == 1]
 
-        # Оставим только с нормальной уверенностью
         filtered_occupied = [b for b in occupied_spots if float(b.conf[0]) > CONFIDENCE_THRESHOLD]
         filtered_vacant = [b for b in vacant_spots if float(b.conf[0]) > CONFIDENCE_THRESHOLD]
 
-        # Подсчитаем общее количество мест (occupied + vacant)
         total_spots = len(filtered_occupied) + len(filtered_vacant)
 
-        # Проверка валидности изображения: если нет ни занятых, ни свободных мест
         if total_spots == 0:
             elapsed = time.time() - start_time
             update_error(cursor, task_id, "Изображение невалидно: не обнаружены парковочные места", elapsed)
-            log_info(f"[Task {task_id}] ⚠️ Парковочные места не найдены (ни занятых, ни свободных)")
+            log_info(f"[Task {task_id}] ⚠️ Парковочные места не найдены")
+            notify_laravel(task_id, cursor.connection)
             return
 
         occupied_count = len(filtered_occupied)
-        occupancy_rate = round((occupied_count / total_spots) * 100, 2) if total_spots > 0 else 0
+        occupancy_rate = round((occupied_count / total_spots) * 100, 2)
 
-        # Преобразуем bbox + confidence к сериализуемым типам
-        occupied_data = [{
-            "confidence": float(b.conf[0]),
-            "box": list(map(float, b.xyxy[0]))
-        } for b in filtered_occupied]
+        occupied_data = [{"confidence": float(b.conf[0]), "box": list(map(float, b.xyxy[0]))} for b in filtered_occupied]
+        vacant_data = [{"confidence": float(b.conf[0]), "box": list(map(float, b.xyxy[0]))} for b in filtered_vacant]
 
-        vacant_data = [{
-            "confidence": float(b.conf[0]),
-            "box": list(map(float, b.xyxy[0]))
-        } for b in filtered_vacant]
-
-        # Формируем итоговый результат
         detection_summary = json.dumps({
             "occupied_count": occupied_count,
             "vacant_count": len(filtered_vacant),
@@ -141,23 +144,21 @@ def process_task(cursor, task):
             "vacant_spots": vacant_data
         })
 
-        # Сохранение результата в файл для отладки
         with open(os.path.join(LOG_DIR, f"task_{task_id}_result.json"), "w") as f:
             json.dump(json.loads(detection_summary), f, indent=4)
 
         elapsed = time.time() - start_time
         update_response(cursor, task_id, detection_summary, occupancy_rate, elapsed)
 
-        # Логирование в зависимости от ситуации
-        if occupied_count == total_spots:
-            log_info(f"[Task {task_id}] ✅ Успешно: Все {total_spots} мест заняты, 100% заполнено, за {elapsed:.2f}s")
-        else:
-            log_info(f"[Task {task_id}] ✅ Успешно: {occupied_count}/{total_spots} мест занято, {occupancy_rate}% заполнено, за {elapsed:.2f}s")
+        log_info(f"[Task {task_id}] ✅ Обработано: {occupied_count}/{total_spots} занято, {occupancy_rate}%")
+
+        notify_laravel(task_id, cursor.connection)
 
     except Exception as e:
         elapsed = time.time() - start_time
         update_error(cursor, task_id, str(e), elapsed)
-        log_error(f"[Task {task_id}] ❌ Ошибка обработки: {e}")
+        log_error(f"[Task {task_id}] ❌ Ошибка: {e}")
+        notify_laravel(task_id, cursor.connection)
 
 def main():
     log_info("🚀 Воркер запущен")
@@ -168,7 +169,7 @@ def main():
 
             task = fetch_next_task(cursor)
             if task:
-                log_info(f"📥 Найдена задача ID={task['id']}")
+                log_info(f"📥 Задача найдена: ID={task['id']}")
                 process_task(cursor, task)
             else:
                 time.sleep(2)
@@ -177,7 +178,7 @@ def main():
             log_error(f"💥 Ошибка БД: {db_err}")
             time.sleep(5)
         except Exception as err:
-            log_error(f"💥 Общая ошибка воркера: {err}")
+            log_error(f"💥 Общая ошибка: {err}")
             time.sleep(5)
         finally:
             if conn.is_connected():
