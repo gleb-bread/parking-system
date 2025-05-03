@@ -36,7 +36,7 @@ DB_CONFIG = {
 
 # === МОДЕЛЬ YOLO ===
 # Используем обученную модель из runs/detect/parking_space_model11/weights/best.pt
-model = YOLO('runs/detect/parking_space_model11/weights/best.pt')
+model = YOLO('runs/detect/parking_space_model/weights/best.pt')
 
 # Порог уверенности
 CONFIDENCE_THRESHOLD = 0.3

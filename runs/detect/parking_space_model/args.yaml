@@ -1,7 +1,7 @@
 task: detect
 mode: train
-model: yolov8n.pt
-data: /datasets/parking_space/data.yaml
+model: runs/detect/parking_space_model13/weights/best.pt
+data: /Users/glebivanov/parking-system/datasets/parking_space/data.yaml
 epochs: 50
 time: null
 patience: 100
