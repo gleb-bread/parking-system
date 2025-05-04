@@ -10,7 +10,9 @@ export type DTO = {
     response: string | null;
     accuracy: number | null;
     created_at: string;
+    result_img: string | null;
     updated_at: string;
+    upload: DTOs.UploadDTO.DTO;
 };
 
 export const toModel = function (dto: DTO): Models.AiRequest {

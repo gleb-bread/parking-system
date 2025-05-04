@@ -7,4 +7,8 @@ use App\Http\Controllers\AIRequestController;
 
 Route::post('/upload', [UploadController::class, 'upload']);
 
-Route::post('/ai_request/updated', [AIRequestController::class, 'updated']);
+Route::patch('/ai-request', [AIRequestController::class, 'updated']);
+Route::get('/ai-request', [AIRequestController::class, 'getAll']);
+
+Route::get('/export/{format}', [App\Http\Controllers\ExportController::class, 'export']);
+

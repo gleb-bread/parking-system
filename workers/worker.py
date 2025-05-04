@@ -3,12 +3,16 @@ import mysql.connector
 import os
 import logging
 import json
+from datetime import datetime
 import requests
 from ultralytics import YOLO
 
 # === ЛОГИ ===
 LOG_DIR = 'logs'
 os.makedirs(LOG_DIR, exist_ok=True)
+
+RESULT_DIR = 'public/storage/result'
+os.makedirs(RESULT_DIR, exist_ok=True)
 
 logging.basicConfig(
     filename=os.path.join(LOG_DIR, 'worker.log'),
@@ -36,7 +40,7 @@ DB_CONFIG = {
 }
 
 # === URL Laravel-эндпоинта ===
-LARAVEL_ENDPOINT = 'http://localhost:8000/api/ai-request/update'
+LARAVEL_ENDPOINT = 'http://localhost:8000/api/ai-request'
 
 # === МОДЕЛЬ YOLO ===
 model = YOLO('runs/detect/parking_space_model/weights/best.pt')
@@ -59,12 +63,12 @@ def fetch_next_task(cursor):
 def update_status(cursor, task_id, status):
     cursor.execute("UPDATE ai_requests SET status = %s WHERE id = %s", (status, task_id))
 
-def update_response(cursor, task_id, response, accuracy, time_spent):
+def update_response(cursor, task_id, response, accuracy, time_spent, result_img_path):
     cursor.execute("""
         UPDATE ai_requests
-        SET status = 'success', response = %s, accuracy = %s, time = %s
+        SET status = 'success', response = %s, accuracy = %s, time = %s, result_img = %s
         WHERE id = %s
-    """, (response, accuracy, time_spent, task_id))
+    """, (response, accuracy, time_spent, result_img_path, task_id))
 
 def update_error(cursor, task_id, error_msg, time_spent):
     cursor.execute("""
@@ -86,7 +90,19 @@ def notify_laravel(task_id, conn):
         if not data:
             log_error(f"[Task {task_id}] ❗ Не удалось получить данные для отправки")
             return
-        response = requests.post(LARAVEL_ENDPOINT, json=data)
+
+        def convert_datetime(obj):
+            if isinstance(obj, datetime):
+                return obj.strftime('%Y-%m-%d %H:%M:%S')
+            raise TypeError("Type not serializable")
+
+        try:
+            data = json.loads(json.dumps(data, default=convert_datetime))
+        except TypeError as e:
+            log_error(f"[Task {task_id}] ❗ Ошибка сериализации данных: {e}")
+            return
+
+        response = requests.patch(LARAVEL_ENDPOINT, json=data)
         if response.status_code == 200:
             log_info(f"[Task {task_id}] 🔔 Laravel уведомлен об обновлении")
         else:
@@ -94,7 +110,7 @@ def notify_laravel(task_id, conn):
     except Exception as e:
         log_error(f"[Task {task_id}] 💥 Ошибка при отправке запроса в Laravel: {e}")
 
-def process_task(cursor, task):
+def process_task(conn, cursor, task):
     task_id = task['id']
     upload_id = task['upload_id']
     update_status(cursor, task_id, 'processing')
@@ -105,7 +121,7 @@ def process_task(cursor, task):
         elapsed = time.time() - start_time
         update_error(cursor, task_id, f"File not found for upload_id {upload_id}", elapsed)
         log_error(f"[Task {task_id}] ❌ Файл не найден для upload_id={upload_id}")
-        notify_laravel(task_id, cursor.connection)
+        notify_laravel(task_id, conn)
         return
 
     file_path = os.path.join('storage/app/public', upload_path)
@@ -126,7 +142,7 @@ def process_task(cursor, task):
             elapsed = time.time() - start_time
             update_error(cursor, task_id, "Изображение невалидно: не обнаружены парковочные места", elapsed)
             log_info(f"[Task {task_id}] ⚠️ Парковочные места не найдены")
-            notify_laravel(task_id, cursor.connection)
+            notify_laravel(task_id, conn)
             return
 
         occupied_count = len(filtered_occupied)
@@ -144,21 +160,28 @@ def process_task(cursor, task):
             "vacant_spots": vacant_data
         })
 
+        # Сохраняем изображение с аннотациями
+        result_image_path = os.path.join(RESULT_DIR, f"task_{task_id}_result.jpg")
+        results[0].save(filename=result_image_path)
+
+        # Путь для БД без public/storage
+        relative_result_path = result_image_path.replace('public/storage/', '')
+
         with open(os.path.join(LOG_DIR, f"task_{task_id}_result.json"), "w") as f:
             json.dump(json.loads(detection_summary), f, indent=4)
 
         elapsed = time.time() - start_time
-        update_response(cursor, task_id, detection_summary, occupancy_rate, elapsed)
+        update_response(cursor, task_id, detection_summary, occupancy_rate, elapsed, relative_result_path)
 
         log_info(f"[Task {task_id}] ✅ Обработано: {occupied_count}/{total_spots} занято, {occupancy_rate}%")
 
-        notify_laravel(task_id, cursor.connection)
+        notify_laravel(task_id, conn)
 
     except Exception as e:
         elapsed = time.time() - start_time
         update_error(cursor, task_id, str(e), elapsed)
         log_error(f"[Task {task_id}] ❌ Ошибка: {e}")
-        notify_laravel(task_id, cursor.connection)
+        notify_laravel(task_id, conn)
 
 def main():
     log_info("🚀 Воркер запущен")
@@ -170,7 +193,7 @@ def main():
             task = fetch_next_task(cursor)
             if task:
                 log_info(f"📥 Задача найдена: ID={task['id']}")
-                process_task(cursor, task)
+                process_task(conn, cursor, task)
             else:
                 time.sleep(2)
 

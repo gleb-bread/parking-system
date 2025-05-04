@@ -5,6 +5,7 @@ import * as components from "vuetify/components";
 import * as directives from "vuetify/directives";
 import "vuetify/styles";
 import { createPinia } from "pinia";
+import { Scripts } from "./app/script";
 
 const vuetify = createVuetify({
     components,
@@ -12,4 +13,8 @@ const vuetify = createVuetify({
 });
 const pinia = createPinia();
 
-createApp(App).use(vuetify).use(pinia).mount("#app");
+createApp(App)
+    .use(vuetify)
+    .use(pinia)
+    .use(Scripts.Loadings.DefaultLoad.DefaultLoad)
+    .mount("#app");

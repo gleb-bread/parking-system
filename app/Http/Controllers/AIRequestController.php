@@ -32,4 +32,11 @@ class AIRequestController extends Controller
 
         return response()->json(['message' => 'Updated successfully']);
     }
+
+    public function getAll()
+    {
+        $requests = AiRequest::orderByDesc('created_at')->with('upload')->get();
+
+        return response()->json($requests);
+    }
 }
